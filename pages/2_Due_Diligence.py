@@ -1,5 +1,5 @@
 """
-Page Due Diligence - Analyse terrain approfondie et vérification des points de contrôle.
+Page Due Diligence - Analyse terrain approfondie avec assistance IA.
 """
 import streamlit as st
 from datetime import datetime
@@ -7,156 +7,103 @@ from datetime import datetime
 from models.deal import Deal, DealStage, DealStatus
 from services.deal_storage import get_deal_storage
 from config.dd_checklists import generate_dd_checklist, get_checklist_summary
-from config.countries import IPAE3_COUNTRIES
+from config.countries import IPAE3_COUNTRIES, get_country_for_prompt
 from formatters.checklist_formatter import export_checklist_to_excel
+from engine.llm_service import get_llm_manager, ProviderType
+from prompts.dd_prompts import DD_SYSTEM_PROMPT, format_dd_analysis_prompt, format_dd_synthesis_prompt
 
-st.set_page_config(
-    page_title="Due Diligence - ESG Analyzer",
-    page_icon="📋",
-    layout="wide"
-)
+st.set_page_config(page_title="Due Diligence - ESG Analyzer", page_icon="📋", layout="wide")
 
-# Initialiser le storage
 storage = get_deal_storage()
 
-# Header
 st.title("📋 Due Diligence")
 st.markdown("Analyse terrain et vérification des points de contrôle ESG")
-
 st.markdown("---")
 
-# Récupérer les deals en DD
-dd_deals = storage.get_by_stage(DealStage.DUE_DILIGENCE)
-
-# Aussi récupérer les deals screening approuvés qui peuvent passer en DD
+# Deals prêts pour DD
 screening_approved = storage.get_by_status(DealStage.SCREENING, DealStatus.APPROVED)
-
-# Section: Deals prêts à passer en DD
 if screening_approved:
-    st.info(f"📥 **{len(screening_approved)} deal(s)** approuvé(s) au screening, prêts pour la DD")
-    
-    with st.expander("Voir les deals prêts pour DD"):
+    st.info(f"📥 **{len(screening_approved)} deal(s)** prêts pour DD")
+    with st.expander("Démarrer la DD"):
         for deal in screening_approved:
-            col1, col2, col3 = st.columns([3, 1, 1])
-            
+            col1, col2 = st.columns([3, 1])
             with col1:
-                st.markdown(f"**{deal.company_name}** — {deal.country} — {deal.sector}")
-            
+                st.markdown(f"**{deal.company_name}** — {deal.country}")
             with col2:
-                st.markdown(f"Cat. {deal.risk_category}")
-            
-            with col3:
-                if st.button(f"▶️ Démarrer DD", key=f"start_dd_{deal.id}"):
-                    try:
-                        deal.advance_stage(DealStage.DUE_DILIGENCE)
-                        storage.save(deal)
-                        st.success(f"DD démarrée pour {deal.company_name}")
-                        st.rerun()
-                    except ValueError as e:
-                        st.error(f"Erreur : {e}")
-    
+                if st.button(f"▶️ Démarrer", key=f"start_{deal.id}"):
+                    deal.advance_stage(DealStage.DUE_DILIGENCE)
+                    storage.save(deal)
+                    st.rerun()
     st.markdown("---")
 
-# Vérifier s'il y a des deals en DD
+# Deals en DD
+dd_deals = storage.get_by_stage(DealStage.DUE_DILIGENCE)
+
 if not dd_deals:
-    st.warning("📭 Aucun deal en Due Diligence actuellement.")
-    st.info("💡 Approuvez des deals au Screening pour les passer en DD.")
+    st.warning("📭 Aucun deal en Due Diligence.")
     st.stop()
 
-# Sélectionner un deal
-st.subheader("Sélectionner un deal")
+# Sélection
+col1, col2 = st.columns([3, 1])
+with col1:
+    selected_id = st.selectbox("Sélectionner un deal", options=[d.id for d in dd_deals], format_func=lambda x: f"{storage.get(x).company_name} ({x})")
+with col2:
+    llm_provider = st.selectbox("Fournisseur IA", ["anthropic", "openai", "deepseek"], format_func=lambda x: {"anthropic": "Claude", "openai": "GPT-4", "deepseek": "DeepSeek"}[x])
 
-selected_deal_id = st.selectbox(
-    "Deal",
-    options=[d.id for d in dd_deals],
-    format_func=lambda x: f"{storage.get(x).company_name} ({x})",
-    key="dd_deal_selector"
-)
-
-deal = storage.get(selected_deal_id)
-
+deal = storage.get(selected_id)
 if not deal:
     st.error("Deal non trouvé")
     st.stop()
 
-# Afficher les infos du deal
 st.markdown("---")
 st.header(f"📋 DD - {deal.company_name}")
 
-# Info résumé
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
     st.metric("Pays", deal.country)
 with col2:
     st.metric("Secteur", deal.sector)
 with col3:
-    risk_info_color = {"A": "🔴", "B+": "🟠", "B-": "🟡", "C": "🟢"}.get(deal.risk_category, "⚪")
-    st.metric("Risque", f"{risk_info_color} Cat. {deal.risk_category}")
+    st.metric("Risque", f"Cat. {deal.risk_category}")
 with col4:
     st.metric("2X", "✅" if deal.two_x_eligible else "❌")
 
 st.markdown("---")
 
-# Tabs pour la DD
-tab1, tab2, tab3, tab4 = st.tabs(["📋 Checklist", "📄 Documents", "📝 Notes", "✅ Validation"])
+tab1, tab2, tab3, tab4 = st.tabs(["📋 Checklist", "🤖 Analyse IA", "📝 Notes", "✅ Validation"])
 
 # =============================================================================
-# TAB 1: Checklist DD
+# TAB 1: Checklist
 # =============================================================================
 with tab1:
     st.subheader("Checklist Due Diligence")
     
-    # Générer la checklist personnalisée
     country_info = IPAE3_COUNTRIES.get(deal.country, {})
-    
-    # Récupérer les gaps 2X pour ajouter des questions
-    two_x_gaps = []
-    if not deal.two_x_eligible:
-        from config.two_x_challenge import calculate_2x_eligibility
-        result = calculate_2x_eligibility(deal.two_x_data, deal.sector)
-        two_x_gaps = result.get("recommendations", [])
-    
     checklist = generate_dd_checklist(
         sector=deal.sector,
         risk_category=deal.risk_category,
         country_fragile=country_info.get('fragile', False),
         country_ldc=country_info.get('ldc', False),
-        two_x_gaps=two_x_gaps
+        two_x_gaps=[]
     )
     
     summary = get_checklist_summary(checklist)
     
-    # Métriques checklist
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
-        st.metric("Total points", summary['total'])
+        st.metric("Total", summary['total'])
     with col2:
         st.metric("Haute priorité", summary['high_priority_count'])
     with col3:
         st.metric("Catégories", len(summary['by_category']))
     with col4:
-        # Export Excel
-        excel_buffer = export_checklist_to_excel(
-            checklist, deal.company_name, deal.sector, 
-            deal.risk_category, deal.country
-        )
-        st.download_button(
-            "📥 Export Excel",
-            excel_buffer,
-            f"checklist_dd_{deal.id}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        excel_buf = export_checklist_to_excel(checklist, deal.company_name, deal.sector, deal.risk_category, deal.country)
+        st.download_button("📥 Excel", excel_buf, f"checklist_{deal.id}.xlsx")
     
-    st.markdown("---")
-    
-    # Récupérer ou initialiser le statut de la checklist
     stage_data = deal.get_current_stage_data()
     if not stage_data.checklist_status:
         stage_data.checklist_status = {item['id']: 'pending' for item in checklist}
     
-    # Afficher la checklist par catégorie
     categories = {}
     for item in checklist:
         cat = item['category']
@@ -165,102 +112,114 @@ with tab1:
         categories[cat].append(item)
     
     for cat_name, items in categories.items():
-        with st.expander(f"**{cat_name}** ({len(items)} points)", expanded=True):
+        with st.expander(f"**{cat_name}** ({len(items)} points)", expanded=False):
             for item in items:
-                col1, col2, col3 = st.columns([4, 1, 1])
-                
+                col1, col2 = st.columns([4, 1])
                 with col1:
                     priority_icon = {"high": "🔴", "medium": "🟠", "low": "🟢"}.get(item['priority'], "")
-                    st.markdown(f"{priority_icon} **{item['question']}**")
-                    st.caption(f"📎 Documents: {', '.join(item['documents'][:2])}{'...' if len(item['documents']) > 2 else ''}")
-                
+                    st.markdown(f"{priority_icon} {item['question']}")
                 with col2:
-                    current_status = stage_data.checklist_status.get(item['id'], 'pending')
-                    status_options = ["pending", "conforme", "partiel", "non_conforme", "na"]
-                    status_labels = {
-                        "pending": "⏳ À vérifier",
-                        "conforme": "✅ Conforme",
-                        "partiel": "⚠️ Partiel",
-                        "non_conforme": "❌ Non conforme",
-                        "na": "➖ N/A"
-                    }
-                    
+                    current = stage_data.checklist_status.get(item['id'], 'pending')
                     new_status = st.selectbox(
-                        "Statut",
-                        options=status_options,
-                        index=status_options.index(current_status),
-                        format_func=lambda x: status_labels[x],
-                        key=f"status_{item['id']}",
+                        "Statut", ["pending", "conforme", "partiel", "non_conforme", "na"],
+                        index=["pending", "conforme", "partiel", "non_conforme", "na"].index(current),
+                        format_func=lambda x: {"pending": "⏳", "conforme": "✅", "partiel": "⚠️", "non_conforme": "❌", "na": "➖"}[x],
+                        key=f"chk_{item['id']}",
                         label_visibility="collapsed"
                     )
-                    
-                    if new_status != current_status:
+                    if new_status != current:
                         stage_data.checklist_status[item['id']] = new_status
-                
-                with col3:
-                    st.caption(f"PS{item.get('ifc_standard', 'N/A')}")
     
-    # Bouton sauvegarder
-    if st.button("💾 Sauvegarder la progression", type="primary", use_container_width=True):
+    if st.button("💾 Sauvegarder", type="primary", use_container_width=True):
         storage.save(deal)
-        st.success("✅ Progression sauvegardée !")
-    
-    # Statistiques de complétion
-    st.markdown("---")
-    st.markdown("### 📊 Progression")
-    
-    total_items = len(stage_data.checklist_status)
-    completed_items = sum(1 for v in stage_data.checklist_status.values() if v in ['conforme', 'na'])
-    progress = completed_items / total_items if total_items > 0 else 0
-    
-    st.progress(progress)
-    st.caption(f"{completed_items}/{total_items} points traités ({progress*100:.0f}%)")
+        st.success("✅ Sauvegardé !")
 
 # =============================================================================
-# TAB 2: Documents
+# TAB 2: Analyse IA
 # =============================================================================
 with tab2:
-    st.subheader("Documents collectés")
+    st.subheader("🤖 Analyse IA Due Diligence")
     
-    # Upload de documents
-    uploaded_files = st.file_uploader(
-        "Ajouter des documents",
-        accept_multiple_files=True,
-        type=["pdf", "docx", "xlsx", "jpg", "png"],
-        key="dd_doc_upload"
-    )
+    stage_data = deal.get_current_stage_data()
     
-    if uploaded_files:
-        for f in uploaded_files:
-            # Vérifier si le document existe déjà
-            existing = [d for d in deal.uploaded_documents if d.get('name') == f.name]
-            if not existing:
-                deal.uploaded_documents.append({
-                    "name": f.name,
-                    "uploaded_at": datetime.now().isoformat(),
-                    "size": len(f.getvalue()),
-                    "stage": "due_diligence"
-                })
-        
-        storage.save(deal)
-        st.success(f"✅ {len(uploaded_files)} document(s) ajouté(s)")
+    col1, col2 = st.columns(2)
     
-    # Liste des documents
-    st.markdown("---")
-    st.markdown("### Documents enregistrés")
+    with col1:
+        if st.button("🤖 Générer l'analyse DD complète", type="primary", use_container_width=True):
+            with st.spinner("🔄 Analyse en cours... (60-90 sec)"):
+                try:
+                    llm_manager = get_llm_manager()
+                    country_context = get_country_for_prompt(deal.country)
+                    
+                    prompt = format_dd_analysis_prompt(
+                        company_name=deal.company_name,
+                        country=deal.country,
+                        country_context=country_context,
+                        sector=deal.sector,
+                        subsector=deal.subsector,
+                        description=deal.description,
+                        risk_category=deal.risk_category,
+                        employees=deal.employees,
+                        two_x_data=deal.two_x_data,
+                        checklist_status=stage_data.checklist_status
+                    )
+                    
+                    response = llm_manager.generate_response(
+                        prompt=prompt,
+                        system_prompt=DD_SYSTEM_PROMPT,
+                        primary_provider=ProviderType(llm_provider),
+                        max_tokens=4000,
+                        temperature=0.3
+                    )
+                    
+                    stage_data.analysis_result = response
+                    storage.save(deal)
+                    st.success("✅ Analyse générée !")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Erreur : {str(e)}")
     
-    if deal.uploaded_documents:
-        for doc in deal.uploaded_documents:
-            col1, col2, col3 = st.columns([3, 1, 1])
-            
-            with col1:
-                st.markdown(f"📄 **{doc['name']}**")
-            with col2:
-                st.caption(f"Ajouté le {doc.get('uploaded_at', 'N/A')[:10]}")
-            with col3:
-                st.caption(f"Stage: {doc.get('stage', 'N/A')}")
-    else:
-        st.info("Aucun document enregistré pour ce deal.")
+    with col2:
+        if st.button("📝 Générer synthèse DD", use_container_width=True):
+            with st.spinner("🔄 Génération..."):
+                try:
+                    llm_manager = get_llm_manager()
+                    
+                    prompt = format_dd_synthesis_prompt(
+                        company_name=deal.company_name,
+                        country=deal.country,
+                        sector=deal.sector,
+                        risk_category=deal.risk_category,
+                        checklist_status=stage_data.checklist_status or {},
+                        conditions=stage_data.conditions or [],
+                        comments=stage_data.comments or []
+                    )
+                    
+                    response = llm_manager.generate_response(
+                        prompt=prompt,
+                        system_prompt=DD_SYSTEM_PROMPT,
+                        primary_provider=ProviderType(llm_provider),
+                        max_tokens=1500,
+                        temperature=0.3
+                    )
+                    
+                    if stage_data.analysis_result:
+                        stage_data.analysis_result += "\n\n---\n\n## SYNTHÈSE DD\n\n" + response
+                    else:
+                        stage_data.analysis_result = response
+                    storage.save(deal)
+                    st.success("✅ Synthèse ajoutée !")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Erreur : {str(e)}")
+    
+    if stage_data.analysis_result:
+        st.markdown("---")
+        st.markdown("### 📋 Résultat de l'analyse")
+        st.markdown(stage_data.analysis_result)
+        st.download_button("📥 Télécharger", stage_data.analysis_result, f"dd_analysis_{deal.id}.md")
 
 # =============================================================================
 # TAB 3: Notes
@@ -268,35 +227,22 @@ with tab2:
 with tab3:
     st.subheader("Notes et observations")
     
-    # Ajouter une note
-    new_comment = st.text_area(
-        "Nouvelle note",
-        placeholder="Ajoutez vos observations de la visite terrain, points d'attention, etc.",
-        key="dd_new_note"
-    )
+    stage_data = deal.get_current_stage_data()
     
-    if st.button("💬 Ajouter la note") and new_comment:
+    new_comment = st.text_area("Nouvelle note", placeholder="Observations terrain...")
+    if st.button("💬 Ajouter") and new_comment:
         deal.add_comment(new_comment, "Analyste DD")
         storage.save(deal)
-        st.success("Note ajoutée !")
         st.rerun()
     
-    # Afficher les notes existantes
     st.markdown("---")
-    st.markdown("### Historique des notes")
-    
-    stage_data = deal.get_current_stage_data()
     if stage_data and stage_data.comments:
-        for comment in reversed(stage_data.comments):
-            st.markdown(f"""
-            **{comment.get('author', 'Anonyme')}** — {comment.get('timestamp', 'N/A')[:16]}
-            
-            {comment.get('text', '')}
-            
-            ---
-            """)
+        for c in reversed(stage_data.comments):
+            st.markdown(f"**{c.get('author')}** — {c.get('timestamp', '')[:16]}")
+            st.markdown(c.get('text', ''))
+            st.markdown("---")
     else:
-        st.info("Aucune note pour ce deal.")
+        st.info("Aucune note.")
 
 # =============================================================================
 # TAB 4: Validation
@@ -306,10 +252,7 @@ with tab4:
     
     stage_data = deal.get_current_stage_data()
     
-    # Résumé de la checklist
     if stage_data.checklist_status:
-        st.markdown("### 📊 Résumé checklist")
-        
         total = len(stage_data.checklist_status)
         conformes = sum(1 for v in stage_data.checklist_status.values() if v == 'conforme')
         partiels = sum(1 for v in stage_data.checklist_status.values() if v == 'partiel')
@@ -317,55 +260,30 @@ with tab4:
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Conformes", conformes, delta=None)
+            st.metric("Conformes", conformes)
         with col2:
-            st.metric("Partiels", partiels, delta=None)
+            st.metric("Partiels", partiels)
         with col3:
-            st.metric("Non conformes", non_conformes, delta=None)
+            st.metric("Non conformes", non_conformes)
         with col4:
             rate = (conformes / total * 100) if total > 0 else 0
-            st.metric("Taux conformité", f"{rate:.0f}%")
+            st.metric("Taux", f"{rate:.0f}%")
     
     st.markdown("---")
+    st.markdown("### Décision DD")
     
-    # Décision
-    st.markdown("### 📋 Décision DD")
+    decision = st.radio("Recommandation", ["GO - Passer au IC", "GO avec conditions", "NO-GO - Rejeter"])
     
-    decision = st.radio(
-        "Recommandation",
-        [
-            "GO - Passer au Comité d'Investissement",
-            "GO avec conditions - Conditions préalables requises",
-            "NO-GO - Rejeter l'opportunité"
-        ],
-        key="dd_decision"
-    )
-    
-    # Conditions si applicable
     conditions_text = ""
     if "conditions" in decision.lower():
-        st.markdown("**Conditions préalables à l'investissement :**")
-        conditions_text = st.text_area(
-            "Liste des conditions (une par ligne)",
-            placeholder="Ex:\n- Mise en place d'une politique HSE\n- Formation du personnel\n- Obtention du permis environnemental",
-            key="dd_conditions"
-        )
+        conditions_text = st.text_area("Conditions (une par ligne)")
     
-    rationale = st.text_area(
-        "Synthèse et justification",
-        placeholder="Résumez les points clés de la DD et justifiez votre recommandation",
-        key="dd_rationale"
-    )
+    rationale = st.text_area("Synthèse et justification")
     
-    st.markdown("---")
-    
-    # Boutons d'action
     col1, col2 = st.columns(2)
     
     with col1:
         if st.button("✅ Valider la DD", type="primary", use_container_width=True):
-            stage_data = deal.get_current_stage_data()
-            
             if "NO-GO" in decision:
                 deal.reject(rationale)
                 storage.save(deal)
@@ -373,27 +291,22 @@ with tab4:
             else:
                 stage_data.decision = "GO" if "GO -" in decision else "GO_WITH_CONDITIONS"
                 stage_data.decision_rationale = rationale
-                
                 if conditions_text:
                     stage_data.conditions = [c.strip() for c in conditions_text.split('\n') if c.strip()]
-                
                 stage_data.status = DealStatus.APPROVED
                 storage.save(deal)
-                st.success("✅ Due Diligence validée !")
+                st.success("✅ DD validée !")
                 st.balloons()
     
     with col2:
-        # Vérifier si on peut avancer
         if stage_data and stage_data.status == DealStatus.APPROVED:
-            if st.button("🚀 Passer au Comité d'Investissement", use_container_width=True):
+            if st.button("🚀 Passer au IC", use_container_width=True):
                 try:
                     deal.advance_stage(DealStage.INVESTMENT_COMMITTEE)
                     storage.save(deal)
-                    st.success("Deal avancé au Comité d'Investissement !")
                     st.rerun()
                 except ValueError as e:
-                    st.error(f"Erreur : {e}")
+                    st.error(str(e))
 
-# Footer
 st.markdown("---")
 st.caption("ESG Analyzer v2.3 | Due Diligence")

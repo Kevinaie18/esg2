@@ -296,10 +296,10 @@ class LLMServiceManager:
             ProviderType.DEEPSEEK: os.getenv("FIREWORKS_API_KEY")
         }
         
-        # Default models - Updated for V1.1
+        # Default models - Updated for V2.3
         self.models = {
             ProviderType.OPENAI: "gpt-4-turbo-preview",
-            ProviderType.ANTHROPIC: "claude-sonnet-4-20250514",
+            ProviderType.ANTHROPIC: "claude-3-opus-20240229",
             ProviderType.DEEPSEEK: "deepseek-chat"
         }
     

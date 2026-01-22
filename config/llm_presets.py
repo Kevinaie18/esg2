@@ -16,6 +16,6 @@ LLM_PRESETS = {
 
 RECOMMENDED_MODELS = {
     "openai": "gpt-4-turbo-preview",
-    "anthropic": "claude-sonnet-4-20250514",
-    "deepseek": "deepseek-chat"
+    "anthropic": "claude-3-opus-20240229",
+    "deepseek": "fireworks_ai/accounts/fireworks/models/deepseek-r1-basic"
 }
